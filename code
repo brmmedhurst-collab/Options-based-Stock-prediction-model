@@ -1,0 +1,1069 @@
+import sys
+import math
+import time
+import warnings
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import List, Tuple, Optional, Dict
+from dataclasses import asdict
+import numpy as np
+import pandas as pd
+from dateutil import tz
+from scipy.optimize import brentq
+from tabulate import tabulate
+import yfinance as yf
+import matplotlib.pyplot as plt
+import os
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+pd.set_option("display.width", 160)
+pd.set_option("display.max_columns", 50)
+
+# --------------------------- Configuration ---------------------------------- #
+CONTRACT_MULTIPLIER = 100  # Shares per 1 option contract (US equity standard)
+MAX_IV = 5.0               # 500% annualized cap for numerical solves
+MIN_IV = 1e-6
+DEFAULT_RF = 0.02          # 2% fallback annual risk-free rate (continuously compounded approx)
+TREASURY_SHORT = "^IRX"    # ~13-week T-Bill yield index on Yahoo
+TREASURY_LONG = "^TNX"     # ~10-year Treasury yield index on Yahoo (value/10 is %)
+
+TARGET_HORIZONS_DAYS = {
+    "1D": 1,
+    "1W": 7,
+    "2W": 14,
+    "1M": 30,
+    "2M": 60,
+    "4M": 120,
+    "6M": 180,
+    "1Y": 365,
+}
+
+# --------------------------- Math Utilities --------------------------------- #
+
+def _norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def _norm_pdf(x: float) -> float:
+    return math.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+
+# Black–Scholes (European) price, delta, gamma with continuous dividend yield q
+
+def bs_price(S: float, K: float, T: float, r: float, q: float, sigma: float, is_call: bool) -> float:
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        # Intrinsic value as a last resort for degenerate cases
+        if is_call:
+            return max(0.0, S - K)
+        else:
+            return max(0.0, K - S)
+    sqrtT = math.sqrt(T)
+    d1 = (math.log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * sqrtT)
+    d2 = d1 - sigma * sqrtT
+    if is_call:
+        return S * math.exp(-q * T) * _norm_cdf(d1) - K * math.exp(-r * T) * _norm_cdf(d2)
+    else:
+        return K * math.exp(-r * T) * _norm_cdf(-d2) - S * math.exp(-q * T) * _norm_cdf(-d1)
+
+
+def bs_delta(S: float, K: float, T: float, r: float, q: float, sigma: float, is_call: bool) -> float:
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        # Limit as T→0: delta tends to sign of intrinsic region
+        if is_call:
+            return float(S > K)
+        else:
+            return float(S < K) - 1.0  # Put delta ≈ -1 if ITM; 0 if OTM
+    sqrtT = math.sqrt(T)
+    d1 = (math.log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * sqrtT)
+    if is_call:
+        return math.exp(-q * T) * _norm_cdf(d1)
+    else:
+        return math.exp(-q * T) * (_norm_cdf(d1) - 1.0)
+
+
+def bs_gamma(S: float, K: float, T: float, r: float, q: float, sigma: float) -> float:
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return 0.0
+    sqrtT = math.sqrt(T)
+    d1 = (math.log(S / K) + (r - q + 0.5 * sigma * sigma) * T) / (sigma * sqrtT)
+    return math.exp(-q * T) * _norm_pdf(d1) / (S * sigma * sqrtT)
+
+
+def implied_vol(price: float, S: float, K: float, T: float, r: float, q: float, is_call: bool,
+                 bounds: Tuple[float, float] = (MIN_IV, MAX_IV)) -> Optional[float]:
+    """Compute Black–Scholes implied volatility via Brent root finding.
+
+    Returns None if a robust solution cannot be found within bounds.
+    """
+    if price is None or price <= 0 or S <= 0 or K <= 0 or T <= 0:
+        return None
+
+    def f(sigma: float) -> float:
+        return bs_price(S, K, T, r, q, sigma, is_call) - price
+
+    lo, hi = bounds
+    try:
+        # Ensure function has opposite signs at bounds; if not, widen adaptively
+        flo, fhi = f(lo), f(hi)
+        # Widen high bound if needed
+        expand = 2.0
+        attempts = 0
+        while flo * fhi > 0 and attempts < 10:
+            hi *= expand
+            fhi = f(hi)
+            attempts += 1
+        if flo * fhi > 0:
+            return None
+        sigma = brentq(f, lo, hi, maxiter=200, xtol=1e-8)
+        if not (math.isfinite(sigma) and MIN_IV <= sigma <= MAX_IV * 10):
+            return None
+        return float(sigma)
+    except Exception:
+        return None
+
+# --------------------------- Data Acquisition -------------------------------- #
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def to_years(days: float) -> float:
+    return days / 365.0
+
+
+def fetch_spot_price(ticker: str) -> float:
+    tkr = yf.Ticker(ticker)
+    # Try fast_info first
+    try:
+        fi = tkr.fast_info
+        price = fi.get("last_price") or fi.get("regular_market_price")
+        if price and price > 0:
+            return float(price)
+    except Exception:
+        pass
+    # Fallback: last close from history
+    hist = tkr.history(period="5d", interval="1d")
+    if not hist.empty:
+        return float(hist["Close"].dropna().iloc[-1])
+    raise RuntimeError(f"Unable to fetch a valid spot price for {ticker}.")
+
+
+def fetch_dividend_yield(ticker: str) -> float:
+    tkr = yf.Ticker(ticker)
+    # Try info and fast_info fields; treat as *annual* dividend yield
+    for attr in ("dividendYield",):
+        try:
+            info = tkr.info
+            if attr in info and info[attr] is not None:
+                y = float(info[attr])
+                if y is not None and y >= 0 and y < 2:  # sanity bound (<200%)
+                    return y
+        except Exception:
+            pass
+    try:
+        fi = tkr.fast_info
+        y = fi.get("dividend_yield")
+        if y is not None and y >= 0 and y < 2:
+            return float(y)
+    except Exception:
+        pass
+    return 0.0
+
+
+def fetch_risk_free_rate(T: float) -> float:
+    """Estimate annualized risk-free rate for maturity T (in years).
+
+    Uses Yahoo Finance treasury yield indexes. If unavailable, DEFAULT_RF.
+    """
+    def _last_close(sym: str) -> Optional[float]:
+        try:
+            h = yf.Ticker(sym).history(period="10d", interval="1d")["Close"].dropna()
+            if not h.empty:
+                return float(h.iloc[-1])
+        except Exception:
+            return None
+        return None
+
+    y3m = _last_close(TREASURY_SHORT)  # ^IRX (approx percent)
+    y10 = _last_close(TREASURY_LONG)   # ^TNX (index ~ 10x percent)
+
+    def _to_decimal(y: Optional[float], long: bool) -> Optional[float]:
+        if y is None:
+            return None
+        # ^IRX prints percent; ^TNX prints percent * 10. Normalize both.
+        if long:
+            # If value looks like 45.12 => 4.512%
+            y = (y / 10.0) / 100.0 if y > 1.0 else y
+        else:
+            y = (y / 100.0) if y > 1.0 else y
+        if y is None or y < -0.01 or y > 1.0:
+            return None
+        return float(y)
+
+    y3m = _to_decimal(y3m, long=False)
+    y10 = _to_decimal(y10, long=True)
+
+    if y3m is None and y10 is None:
+        return DEFAULT_RF
+
+    if T <= 0.25:  # up to ~3 months
+        return y3m if y3m is not None else (y10 if y10 is not None else DEFAULT_RF)
+    if T >= 1.0:
+        return y10 if y10 is not None else (y3m if y3m is not None else DEFAULT_RF)
+
+    # Linear interpolation in maturity between 3m and 10y
+    t0, t1 = 0.25, 10.0
+    r0 = y3m if y3m is not None else (y10 if y10 is not None else DEFAULT_RF)
+    r1 = y10 if y10 is not None else (y3m if y3m is not None else DEFAULT_RF)
+    w = (T - t0) / (t1 - t0)
+    return (1 - w) * r0 + w * r1
+
+
+def fetch_option_expirations(ticker: str) -> List[datetime]:
+    tkr = yf.Ticker(ticker)
+    try:
+        exps = tkr.options
+        if not exps:
+            return []
+        # Yahoo returns strings like '2025-09-19' in UTC dates
+        return [datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc) for d in exps]
+    except Exception:
+        return []
+
+
+def fetch_option_chain(ticker: str, expiry: datetime) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    tkr = yf.Ticker(ticker)
+    ds = expiry.strftime("%Y-%m-%d")
+    chain = tkr.option_chain(ds)
+    calls = chain.calls.copy()
+    puts = chain.puts.copy()
+    for df in (calls, puts):
+        # Normalize column names that we will use
+        for col in ("bid", "ask", "lastPrice", "impliedVolatility", "openInterest", "volume"):
+            if col not in df.columns:
+                df[col] = np.nan
+        # Mid price
+        df["mid"] = np.where(np.isfinite(df["bid"]) & np.isfinite(df["ask"]) & (df["bid"] > 0) & (df["ask"] > 0),
+                              0.5 * (df["bid"] + df["ask"]), df["lastPrice"])
+        # Clean negatives/zeros
+        df.loc[~np.isfinite(df["mid"]) | (df["mid"] <= 0), "mid"] = np.nan
+    return calls, puts
+
+# --------------------------- Analytics -------------------------------------- #
+
+@dataclass
+class ExpiryAnalytics:
+    expiry: datetime
+    T_years: float
+    S: float
+    r: float
+    q: float
+    K_atm: float
+    iv_atm: Optional[float]
+    call_mid_atm: Optional[float]
+    put_mid_atm: Optional[float]
+    straddle_mid: Optional[float]
+    rr25: Optional[float]
+    total_gamma_dollar: Optional[float]
+    gamma_bias_dollar: Optional[float]
+
+
+def nearest_expiry_at_or_after(expirations: List[datetime], target_date: datetime) -> Optional[datetime]:
+    future = [d for d in expirations if d >= target_date]
+    if not future:
+        return max(expirations) if expirations else None
+    return min(future)
+
+
+def choose_atm_strike(strikes: np.ndarray, S: float, r: float, q: float, T: float) -> float:
+    # Use forward ATM (K ≈ forward F)
+    F = S * math.exp((r - q) * T)
+    idx = int(np.argmin(np.abs(strikes - F)))
+    return float(strikes[idx])
+
+
+def _safe_iv(price: Optional[float], S: float, K: float, T: float, r: float, q: float, is_call: bool) -> Optional[float]:
+    if price is None or not math.isfinite(price) or price <= 0:
+        return None
+    return implied_vol(price, S, K, T, r, q, is_call)
+
+
+def compute_rr25(calls: pd.DataFrame, puts: pd.DataFrame, S: float, T: float, r: float, q: float, iv_seed: float) -> Optional[float]:
+    """Approximate 25-delta risk reversal.
+
+    Steps:
+      1) Using iv_seed, compute Black–Scholes delta for all calls/puts.
+      2) Pick call with delta closest to +0.25 and put closest to −0.25.
+      3) Solve each option's implied vol from its mid price.
+      4) RR25 = IV_call_25d − IV_put_25d
+    """
+    if not (math.isfinite(S) and T > 0 and math.isfinite(iv_seed) and iv_seed > 0):
+        return None
+
+    dfc = calls.dropna(subset=["mid", "strike"]).copy()
+    dfp = puts.dropna(subset=["mid", "strike"]).copy()
+    if dfc.empty or dfp.empty:
+        return None
+
+    dfc["delta"] = dfc.apply(lambda r_: bs_delta(S, float(r_["strike"]), T, r, q, iv_seed, True), axis=1)
+    dfp["delta"] = dfp.apply(lambda r_: bs_delta(S, float(r_["strike"]), T, r, q, iv_seed, False), axis=1)
+
+    call_25 = dfc.iloc[(dfc["delta"] - 0.25).abs().argsort()[:1]]
+    put_25  = dfp.iloc[(dfp["delta"] + 0.25).abs().argsort()[:1]]
+
+    if call_25.empty or put_25.empty:
+        return None
+
+    Kc, Pc = float(call_25["strike"].iloc[0]), float(call_25["mid"].iloc[0])
+    Kp, Pp = float(put_25["strike"].iloc[0]), float(put_25["mid"].iloc[0])
+
+    ivc = _safe_iv(Pc, S, Kc, T, r, q, True)
+    ivp = _safe_iv(Pp, S, Kp, T, r, q, False)
+    if ivc is None or ivp is None:
+        return None
+    return float(ivc - ivp)
+
+
+def compute_gamma_metrics(calls: pd.DataFrame, puts: pd.DataFrame, S: float, T: float, r: float, q: float,
+                          iv_seed: float, moneyness_band: Tuple[float, float] = (0.7, 1.3)) -> Tuple[Optional[float], Optional[float]]:
+    """Compute approximate total dollar gamma exposure and put–call gamma bias.
+
+    We approximate per-option IV with iv_seed for gamma (stable enough for gamma).
+    Only include strikes with K/S in [band] to avoid far tails with noisy quotes.
+    Dollar gamma (per 1.0 move in underlying) ≈ gamma * S^2 * OI * CONTRACT_MULTIPLIER.
+    We also report a bias = call_gamma_$ − put_gamma_$.
+    """
+    if not (math.isfinite(S) and T > 0 and math.isfinite(iv_seed) and iv_seed > 0):
+        return None, None
+
+    lower, upper = moneyness_band
+    g_call = 0.0
+    g_put = 0.0
+
+    for df, is_call in ((calls, True), (puts, False)):
+        for _, row in df.iterrows():
+            K = float(row.get("strike", np.nan))
+            if not math.isfinite(K) or K <= 0:
+                continue
+            m = K / S
+            if m < lower or m > upper:
+                continue
+            oi = row.get("openInterest", np.nan)
+            if oi is None or not math.isfinite(oi) or oi <= 0:
+                continue
+            gamma = bs_gamma(S, K, T, r, q, iv_seed)
+            if gamma <= 0 or not math.isfinite(gamma):
+                continue
+            dollar_gamma = gamma * (S ** 2) * float(oi) * CONTRACT_MULTIPLIER
+            if is_call:
+                g_call += dollar_gamma
+            else:
+                g_put += dollar_gamma
+
+    total = g_call + g_put
+    bias = g_call - g_put
+    if total == 0:
+        return None, None
+    return float(total), float(bias)
+
+
+def analyze_expiry(ticker: str, expiry: datetime, S: float, q: float) -> Optional[ExpiryAnalytics]:
+    T = max((expiry - now_utc()).total_seconds() / (365.0 * 24 * 3600), 0.0)
+    if T <= 0:
+        return None
+    r = fetch_risk_free_rate(T)
+    calls, puts = fetch_option_chain(ticker, expiry)
+    if calls.empty or puts.empty:
+        return None
+
+    strikes = np.unique(np.concatenate([calls["strike"].values, puts["strike"].values]))
+    strikes = strikes[np.isfinite(strikes)]
+    if strikes.size == 0:
+        return None
+
+    K_atm = choose_atm_strike(strikes, S, r, q, T)
+
+    # Find closest call/put rows to K_atm
+    call_atm = calls.iloc[(calls["strike"] - K_atm).abs().argsort()[:1]]
+    put_atm  = puts.iloc[(puts["strike"] - K_atm).abs().argsort()[:1]]
+
+    call_mid = float(call_atm["mid"].iloc[0]) if not call_atm.empty and math.isfinite(call_atm["mid"].iloc[0]) else None
+    put_mid  = float(put_atm["mid"].iloc[0]) if not put_atm.empty and math.isfinite(put_atm["mid"].iloc[0]) else None
+
+    # Seed IV from Yahoo if present, otherwise compute from mid
+    iv_seeds = []
+    for df, is_call in ((call_atm, True), (put_atm, False)):
+        if not df.empty:
+            iv_col = df.get("impliedVolatility")
+            if iv_col is not None and math.isfinite(float(iv_col.iloc[0])) and float(iv_col.iloc[0]) > 0:
+                iv_seeds.append(float(iv_col.iloc[0]))
+    iv_seed = float(np.nanmean(iv_seeds)) if iv_seeds else None
+
+    if iv_seed is None:
+        # Derive from ATM prices, prefer straddle consistency: take average of call/put IVs
+        iv_call = _safe_iv(call_mid, S, K_atm, T, r, q, True) if call_mid else None
+        iv_put  = _safe_iv(put_mid,  S, K_atm, T, r, q, False) if put_mid  else None
+        if iv_call and iv_put:
+            iv_seed = 0.5 * (iv_call + iv_put)
+        else:
+            iv_seed = iv_call or iv_put  # maybe one side only
+
+    # RR25
+    rr25 = compute_rr25(calls, puts, S, T, r, q, iv_seed) if iv_seed else None
+
+    # Gamma metrics
+    total_gamma, gamma_bias = compute_gamma_metrics(calls, puts, S, T, r, q, iv_seed if iv_seed else 0.3)
+
+    return ExpiryAnalytics(
+        expiry=expiry,
+        T_years=T,
+        S=S,
+        r=r,
+        q=q,
+        K_atm=K_atm,
+        iv_atm=iv_seed,
+        call_mid_atm=call_mid,
+        put_mid_atm=put_mid,
+        straddle_mid=(call_mid + put_mid) if (call_mid and put_mid) else None,
+        rr25=rr25,
+        total_gamma_dollar=total_gamma,
+        gamma_bias_dollar=gamma_bias,
+    )
+
+
+def build_term_structure(analytics: List[ExpiryAnalytics]) -> pd.DataFrame:
+    rows = []
+    for a in analytics:
+        if a.iv_atm and a.T_years and a.iv_atm > 0 and a.T_years > 0:
+            rows.append({
+                "expiry": a.expiry,
+                "T_years": a.T_years,
+                "iv_atm": a.iv_atm,
+                "tot_var": (a.iv_atm ** 2) * a.T_years,
+                "rr25": a.rr25,
+                "total_gamma_$": a.total_gamma_dollar,
+                "gamma_bias_$": a.gamma_bias_dollar,
+            })
+    if not rows:
+        return pd.DataFrame(columns=["expiry", "T_years", "iv_atm", "tot_var", "rr25", "total_gamma_$", "gamma_bias_$"])
+    df = pd.DataFrame(rows).sort_values("T_years").reset_index(drop=True)
+    return df
+
+
+def interpolate_tot_var(df_ts: pd.DataFrame, T_target: float) -> Optional[float]:
+    if df_ts.empty:
+        return None
+    # Exact match
+    exact = df_ts[df_ts["T_years"].sub(T_target).abs() < 1e-9]
+    if not exact.empty:
+        return float(exact["tot_var"].iloc[0])
+    # If outside range, extrapolate using nearest endpoint slope (flat in variance)
+    if T_target <= df_ts["T_years"].min():
+        return float(df_ts["tot_var"].iloc[0])
+    if T_target >= df_ts["T_years"].max():
+        return float(df_ts["tot_var"].iloc[-1])
+    # Linear interpolate total variance between bracketing expiries
+    after = df_ts[df_ts["T_years"] >= T_target].iloc[0]
+    before = df_ts[df_ts["T_years"] <= T_target].iloc[-1]
+    t0, v0 = float(before["T_years"]), float(before["tot_var"])
+    t1, v1 = float(after["T_years"]),  float(after["tot_var"])
+    w = (T_target - t0) / (t1 - t0)
+    return (1 - w) * v0 + w * v1
+
+
+def summarize_expected_moves(S: float, df_ts: pd.DataFrame, expirations: List[datetime]) -> pd.DataFrame:
+    """Produce the requested horizons summary using variance interpolation (method A)
+    and nearest listed expiration (method B).
+    """
+    now = now_utc()
+
+    # Map each target horizon to nearest listed expiration (>= target)
+    horizon_rows = []
+    for label, days in TARGET_HORIZONS_DAYS.items():
+        T_target_years = to_years(days)
+        tot_var = interpolate_tot_var(df_ts, T_target_years)
+        if tot_var is not None and tot_var >= 0:
+            iv_equiv = math.sqrt(tot_var / T_target_years) if T_target_years > 0 else 0.0
+            exp_move_A_abs = S * math.sqrt(tot_var)
+            exp_move_A_pct = math.sqrt(tot_var)
+        else:
+            iv_equiv = None
+            exp_move_A_abs = None
+            exp_move_A_pct = None
+
+        target_date = now + timedelta(days=days)
+        chosen_exp = nearest_expiry_at_or_after(expirations, target_date)
+        if chosen_exp is not None:
+            ds = chosen_exp.strftime("%Y-%m-%d")
+        else:
+            ds = None
+
+        horizon_rows.append({
+            "horizon": label,
+            "days": days,
+            "equiv_IV_from_TS": iv_equiv,
+            "expected_move_abs_IV": exp_move_A_abs,
+            "expected_move_pct_IV": exp_move_A_pct,
+            "nearest_listed_expiration": ds,
+        })
+
+    df_h = pd.DataFrame(horizon_rows)
+    return df_h
+
+# --------------------------- Main Flow -------------------------------------- #
+
+def main() -> None:
+    print("\nOptions-Implied Expected Move Analyzer\n-------------------------------------\n")
+    ticker = input("Enter ticker (e.g., AAPL): ").strip().upper()
+    if not ticker:
+        print("No ticker provided. Exiting.")
+        sys.exit(1)
+
+    # Fetch spot, dividend yield, expirations
+    try:
+        S = fetch_spot_price(ticker)
+    except Exception as e:
+        print(f"Error fetching spot price for {ticker}: {e}")
+        sys.exit(2)
+
+    q = fetch_dividend_yield(ticker)  # may be 0.0 if unavailable
+    expirations = fetch_option_expirations(ticker)
+    if not expirations:
+        print(f"No listed option expirations found for {ticker}. Exiting.")
+        sys.exit(3)
+
+    print(f"Using spot S = {S:.4f}, dividend_yield q = {q:.4%}")
+
+    # Analyze all expirations to build a term structure and per-expiry metrics
+    analytics: List[ExpiryAnalytics] = []
+    for exp in expirations:
+        a = analyze_expiry(ticker, exp, S, q)
+        if a is not None:
+            analytics.append(a)
+        # Be gentle with remote API
+        time.sleep(0.15)
+
+    if not analytics:
+        print("Failed to compute analytics for any expiration. Exiting.")
+        sys.exit(4)
+
+    # Build term structure table
+    df_ts = build_term_structure(analytics)
+    if df_ts.empty:
+        print("Could not construct an IV term structure. Exiting.")
+        sys.exit(5)
+
+    # Compute horizon summary via variance interpolation
+    df_horizons = summarize_expected_moves(S, df_ts, expirations)
+
+    # Build a per-expiration table including method (B) straddle expected moves
+    rows_exp = []
+    for a in analytics:
+        exp_days = max(int(round(a.T_years * 365.0)), 0)
+        em_abs_iv = S * (a.iv_atm * math.sqrt(a.T_years)) if a.iv_atm and a.iv_atm > 0 else None
+        em_pct_iv = (a.iv_atm * math.sqrt(a.T_years)) if a.iv_atm and a.iv_atm > 0 else None
+        em_abs_str = a.straddle_mid if a.straddle_mid and a.straddle_mid > 0 else None
+        em_pct_str = (em_abs_str / S) if (em_abs_str and S > 0) else None
+        rows_exp.append({
+            "expiration": a.expiry.strftime("%Y-%m-%d"),
+            "days_to_exp": exp_days,
+            "ATM_IV": a.iv_atm,
+            "ATM_straddle_mid": a.straddle_mid,
+            "expected_move_abs_IV": em_abs_iv,
+            "expected_move_pct_IV": em_pct_iv,
+            "expected_move_abs_straddle": em_abs_str,
+            "expected_move_pct_straddle": em_pct_str,
+            "RR25": a.rr25,
+            "total_gamma_$": a.total_gamma_dollar,
+            "gamma_bias_$": a.gamma_bias_dollar,
+        })
+
+    df_exp = pd.DataFrame(rows_exp).sort_values("days_to_exp").reset_index(drop=True)
+
+    # Console outputs
+    print("\n=== Requested Horizons (interpolated from ATM IV term structure) ===\n")
+    df_disp = df_horizons.copy()
+    # Formatting helpers
+    def fmt_pct(x):
+        return None if pd.isna(x) else f"{x*100:.2f}%"
+    def fmt_cash(x):
+        return None if pd.isna(x) else f"${x:,.2f}"
+
+    df_disp["equiv_IV_from_TS"] = df_disp["equiv_IV_from_TS"].apply(lambda v: None if v is None or pd.isna(v) else f"{v:.2%}")
+    df_disp["expected_move_abs_IV"] = df_disp["expected_move_abs_IV"].apply(fmt_cash)
+    df_disp["expected_move_pct_IV"] = df_disp["expected_move_pct_IV"].apply(lambda v: None if v is None or pd.isna(v) else f"{v:.2%}")
+
+    print(tabulate(df_disp, headers="keys", tablefmt="github", showindex=False))
+
+    print("\n=== Per-Expiration Analytics (nearest listed expirations) ===\n")
+    df_show = df_exp.copy()
+    for col in ("ATM_IV", "expected_move_pct_IV", "expected_move_pct_straddle", "RR25"):
+        if col in df_show.columns:
+            df_show[col] = df_show[col].apply(lambda v: None if v is None or pd.isna(v) else f"{v:.2%}")
+    for col in ("ATM_straddle_mid", "expected_move_abs_IV", "expected_move_abs_straddle", "total_gamma_$", "gamma_bias_$"):
+        if col in df_show.columns:
+            df_show[col] = df_show[col].apply(lambda v: None if v is None or pd.isna(v) else f"${v:,.2f}")
+
+    print(tabulate(df_show, headers="keys", tablefmt="github", showindex=False))
+
+    # Export CSV with raw numerical values
+    output_dir = "./output"
+    import os
+    os.makedirs(output_dir, exist_ok=True)
+    out_csv = os.path.join(output_dir, f"{ticker}_options_analytics.csv")
+    with open(out_csv, "w", newline="") as f:
+        df_exp.to_csv(f, index=False)
+    print(f"\nSaved detailed per-expiration analytics to: {out_csv}\n")
+
+    # Brief interpretive notes
+    notes = []
+    notes.append("Method A (IV) scales expected move to exact horizons via variance interpolation.")
+    notes.append("Method B (straddle) uses the actual nearest listed expiration's ATM straddle mid-price.")
+    notes.append("RR25 < 0 implies put IV > call IV (downside tail protection more expensive).")
+    notes.append("Positive gamma bias (call_gamma_$ − put_gamma_$ > 0) can be volatility-dampening; negative can amplify moves.")
+
+    print("Notes:")
+    for i, n in enumerate(notes, 1):
+        print(f"  {i}. {n}")
+# =========================== Backtesting Engine ============================== #
+# Paste this section below your existing analytics section and above main().
+
+BACKTEST_OUTPUT_DIR = "./output/backtests"
+
+def fetch_price_history(ticker: str, years: int = 5, interval: str = "1d") -> pd.DataFrame:
+    """
+    Download historical OHLC data for the chosen lookback.
+    """
+    tkr = yf.Ticker(ticker)
+    period = f"{years}y"
+    hist = tkr.history(period=period, interval=interval, auto_adjust=False)
+    if hist.empty:
+        raise RuntimeError(f"Could not fetch historical price data for {ticker}.")
+    hist = hist.copy()
+    hist.index = pd.to_datetime(hist.index).tz_localize(None)
+    hist = hist.sort_index()
+    return hist
+
+
+def horizon_days_to_market_rows(days: int, trading_days_per_year: int = 252) -> int:
+    """
+    Convert calendar-day horizon to an approximate number of trading rows.
+    Since historical data is usually daily bars, this is a practical approximation.
+    """
+    return max(1, int(round(days * trading_days_per_year / 365.0)))
+
+
+def realized_abs_move_from_history(
+    hist: pd.DataFrame,
+    start_idx: int,
+    horizon_days: int,
+    price_col: str = "Close"
+) -> Optional[float]:
+    """
+    Realized absolute move in dollars: |S_{t+h} - S_t|
+    """
+    h = horizon_days_to_market_rows(horizon_days)
+    end_idx = start_idx + h
+    if end_idx >= len(hist):
+        return None
+    s0 = float(hist.iloc[start_idx][price_col])
+    s1 = float(hist.iloc[end_idx][price_col])
+    if not (math.isfinite(s0) and math.isfinite(s1) and s0 > 0):
+        return None
+    return abs(s1 - s0)
+
+
+def realized_pct_move_from_history(
+    hist: pd.DataFrame,
+    start_idx: int,
+    horizon_days: int,
+    price_col: str = "Close"
+) -> Optional[float]:
+    """
+    Realized absolute move in percent: |S_{t+h} - S_t| / S_t
+    """
+    h = horizon_days_to_market_rows(horizon_days)
+    end_idx = start_idx + h
+    if end_idx >= len(hist):
+        return None
+    s0 = float(hist.iloc[start_idx][price_col])
+    s1 = float(hist.iloc[end_idx][price_col])
+    if not (math.isfinite(s0) and math.isfinite(s1) and s0 > 0):
+        return None
+    return abs(s1 - s0) / s0
+
+
+def nearest_history_date_index(hist: pd.DataFrame, dt: datetime) -> Optional[int]:
+    """
+    Find the nearest historical row index at or before a datetime.
+    """
+    if hist.empty:
+        return None
+    ts = pd.Timestamp(dt).tz_localize(None)
+    eligible = hist.index[hist.index <= ts]
+    if len(eligible) == 0:
+        return None
+    return int(hist.index.get_loc(eligible[-1]))
+
+
+def estimate_move_from_realized_vol(
+    hist: pd.DataFrame,
+    idx: int,
+    horizon_days: int,
+    lookback_days: int = 60,
+    price_col: str = "Close"
+) -> Optional[Tuple[float, float]]:
+    """
+    Fallback historical-volatility predictor.
+    This is NOT options-implied. It is here only so the backtest framework works
+    immediately even without historical options-chain snapshots.
+
+    Returns:
+        (predicted_abs_move, predicted_pct_move)
+    """
+    if idx <= 1:
+        return None
+    start = max(1, idx - lookback_days)
+    px = hist.iloc[start:idx + 1][price_col].astype(float)
+    rets = np.log(px / px.shift(1)).dropna()
+    if len(rets) < 10:
+        return None
+    daily_vol = float(rets.std())
+    horizon_rows = horizon_days_to_market_rows(horizon_days)
+    move_pct = daily_vol * math.sqrt(horizon_rows)
+    spot = float(hist.iloc[idx][price_col])
+    move_abs = spot * move_pct
+    return move_abs, move_pct
+
+
+def predict_expected_move_on_date(
+    ticker: str,
+    asof_dt: datetime,
+    horizon_days: int,
+    hist: Optional[pd.DataFrame] = None,
+    method: str = "hv_proxy",
+) -> Dict[str, Optional[float]]:
+    """
+    Prediction hook used by the backtester.
+
+    IMPORTANT:
+    - Right now this supports a working proxy method: 'hv_proxy'
+    - Later, when you have historical options-chain data, replace or extend this
+      function with a true historical-options predictor.
+
+    Output dict keys:
+        predicted_abs
+        predicted_pct
+        method
+    """
+    if hist is None or hist.empty:
+        return {"predicted_abs": None, "predicted_pct": None, "method": method}
+
+    idx = nearest_history_date_index(hist, asof_dt)
+    if idx is None:
+        return {"predicted_abs": None, "predicted_pct": None, "method": method}
+
+    if method == "hv_proxy":
+        pred = estimate_move_from_realized_vol(hist, idx, horizon_days)
+        if pred is None:
+            return {"predicted_abs": None, "predicted_pct": None, "method": method}
+        pred_abs, pred_pct = pred
+        return {"predicted_abs": pred_abs, "predicted_pct": pred_pct, "method": method}
+
+    # -------------------------------------------------------------------------
+    # FUTURE EXTENSION POINT:
+    # Add your true historical options-based predictor here once you have access
+    # to historical option chains for each as-of date.
+    #
+    # Example:
+    # if method == "historical_options":
+    #     pred_abs, pred_pct = your_historical_options_function(ticker, asof_dt, horizon_days)
+    #     return {"predicted_abs": pred_abs, "predicted_pct": pred_pct, "method": method}
+    # -------------------------------------------------------------------------
+
+    return {"predicted_abs": None, "predicted_pct": None, "method": method}
+
+
+def backtest_single_horizon(
+    ticker: str,
+    hist: pd.DataFrame,
+    horizon_label: str,
+    horizon_days: int,
+    step_days: int = 3,
+    method: str = "hv_proxy",
+    price_col: str = "Close",
+) -> pd.DataFrame:
+    """
+    Rolling historical backtest for a single horizon.
+
+    Every `step_days` rows, the model predicts the future move over the chosen horizon.
+    Then it compares prediction vs realized move.
+    """
+    rows = []
+    step_rows = max(1, horizon_days_to_market_rows(step_days))
+    max_i = len(hist) - horizon_days_to_market_rows(horizon_days) - 1
+
+    for i in range(0, max_i + 1, step_rows):
+        asof_dt = hist.index[i].to_pydatetime()
+        s0 = float(hist.iloc[i][price_col])
+
+        pred = predict_expected_move_on_date(
+            ticker=ticker,
+            asof_dt=asof_dt,
+            horizon_days=horizon_days,
+            hist=hist,
+            method=method,
+        )
+        pred_abs = pred["predicted_abs"]
+        pred_pct = pred["predicted_pct"]
+
+        real_abs = realized_abs_move_from_history(hist, i, horizon_days, price_col=price_col)
+        real_pct = realized_pct_move_from_history(hist, i, horizon_days, price_col=price_col)
+
+        if pred_abs is None or pred_pct is None or real_abs is None or real_pct is None:
+            continue
+
+        signed_error_abs = pred_abs - real_abs
+        abs_error_abs = abs(signed_error_abs)
+
+        signed_error_pct = pred_pct - real_pct
+        abs_error_pct = abs(signed_error_pct)
+
+        ratio = (pred_abs / real_abs) if real_abs > 1e-12 else np.nan
+
+        rows.append({
+            "ticker": ticker,
+            "horizon": horizon_label,
+            "horizon_days": horizon_days,
+            "asof_date": asof_dt.date().isoformat(),
+            "spot": s0,
+            "predicted_abs": pred_abs,
+            "predicted_pct": pred_pct,
+            "realized_abs": real_abs,
+            "realized_pct": real_pct,
+            "signed_error_abs": signed_error_abs,
+            "abs_error_abs": abs_error_abs,
+            "signed_error_pct": signed_error_pct,
+            "abs_error_pct": abs_error_pct,
+            "prediction_to_realized_ratio": ratio,
+            "method": pred["method"],
+        })
+
+    return pd.DataFrame(rows)
+
+
+def summarize_backtest_results(df_bt: pd.DataFrame) -> pd.DataFrame:
+    """
+    Aggregate stats by horizon.
+    """
+    if df_bt.empty:
+        return pd.DataFrame()
+
+    def rmse(x):
+        x = pd.Series(x).dropna()
+        return float(np.sqrt(np.mean(np.square(x)))) if len(x) else np.nan
+
+    grouped = df_bt.groupby(["ticker", "horizon", "horizon_days", "method"], dropna=False)
+
+    out = grouped.agg(
+        n_tests=("asof_date", "count"),
+        mean_pred_abs=("predicted_abs", "mean"),
+        mean_real_abs=("realized_abs", "mean"),
+        mean_signed_error_abs=("signed_error_abs", "mean"),
+        std_signed_error_abs=("signed_error_abs", "std"),
+        mae_abs=("abs_error_abs", "mean"),
+        mean_pred_pct=("predicted_pct", "mean"),
+        mean_real_pct=("realized_pct", "mean"),
+        mean_signed_error_pct=("signed_error_pct", "mean"),
+        std_signed_error_pct=("signed_error_pct", "std"),
+        mae_pct=("abs_error_pct", "mean"),
+        mean_ratio=("prediction_to_realized_ratio", "mean"),
+        std_ratio=("prediction_to_realized_ratio", "std"),
+    ).reset_index()
+
+    rmse_abs_vals = grouped["signed_error_abs"].apply(rmse).reset_index(name="rmse_abs")
+    rmse_pct_vals = grouped["signed_error_pct"].apply(rmse).reset_index(name="rmse_pct")
+
+    out = out.merge(rmse_abs_vals, on=["ticker", "horizon", "horizon_days", "method"], how="left")
+    out = out.merge(rmse_pct_vals, on=["ticker", "horizon", "horizon_days", "method"], how="left")
+
+    return out.sort_values("horizon_days").reset_index(drop=True)
+
+
+def plot_backtest_horizon(df_h: pd.DataFrame, output_dir: str) -> Optional[str]:
+    """
+    Make a chart for one horizon showing predicted vs realized move and error.
+    """
+    if df_h.empty:
+        return None
+
+    horizon = str(df_h["horizon"].iloc[0])
+    ticker = str(df_h["ticker"].iloc[0])
+    method = str(df_h["method"].iloc[0])
+
+    df_plot = df_h.copy()
+    df_plot["asof_date"] = pd.to_datetime(df_plot["asof_date"])
+    df_plot = df_plot.sort_values("asof_date")
+
+    fig = plt.figure(figsize=(12, 6))
+    ax = fig.add_subplot(111)
+    ax.plot(df_plot["asof_date"], df_plot["predicted_pct"] * 100, label="Predicted move (%)")
+    ax.plot(df_plot["asof_date"], df_plot["realized_pct"] * 100, label="Realized move (%)")
+    ax.plot(df_plot["asof_date"], df_plot["signed_error_pct"] * 100, label="Signed error (%)", alpha=0.7)
+
+    ax.set_title(f"{ticker} | {horizon} backtest | method={method}")
+    ax.set_xlabel("As-of date")
+    ax.set_ylabel("Percent move / error")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+
+    os.makedirs(output_dir, exist_ok=True)
+    path = os.path.join(output_dir, f"{ticker}_{horizon}_{method}_backtest.png")
+    fig.savefig(path, dpi=140)
+    plt.close(fig)
+    return path
+
+
+def run_full_backtest(
+    ticker: str,
+    years: int = 5,
+    step_days: int = 3,
+    method: str = "hv_proxy",
+    horizons: Optional[Dict[str, int]] = None,
+    price_col: str = "Close",
+    make_charts: bool = True,
+) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+    """
+    Run the backtest across all requested horizons.
+    Returns:
+        df_all_tests, df_summary, chart_paths
+    """
+    if horizons is None:
+        horizons = TARGET_HORIZONS_DAYS
+
+    hist = fetch_price_history(ticker, years=years, interval="1d")
+
+    all_parts = []
+    chart_paths = []
+
+    for label, days in horizons.items():
+        df_h = backtest_single_horizon(
+            ticker=ticker,
+            hist=hist,
+            horizon_label=label,
+            horizon_days=days,
+            step_days=step_days,
+            method=method,
+            price_col=price_col,
+        )
+        if not df_h.empty:
+            all_parts.append(df_h)
+            if make_charts:
+                chart = plot_backtest_horizon(df_h, BACKTEST_OUTPUT_DIR)
+                if chart is not None:
+                    chart_paths.append(chart)
+
+    if not all_parts:
+        return pd.DataFrame(), pd.DataFrame(), []
+
+    df_all = pd.concat(all_parts, ignore_index=True)
+    df_summary = summarize_backtest_results(df_all)
+
+    os.makedirs(BACKTEST_OUTPUT_DIR, exist_ok=True)
+    all_csv = os.path.join(BACKTEST_OUTPUT_DIR, f"{ticker}_{method}_all_backtests.csv")
+    summary_csv = os.path.join(BACKTEST_OUTPUT_DIR, f"{ticker}_{method}_summary.csv")
+    df_all.to_csv(all_csv, index=False)
+    df_summary.to_csv(summary_csv, index=False)
+
+    return df_all, df_summary, chart_paths
+
+
+def print_backtest_summary(df_summary: pd.DataFrame) -> None:
+    """
+    Console-friendly summary output.
+    """
+    if df_summary.empty:
+        print("\nNo backtest results to display.\n")
+        return
+
+    df_show = df_summary.copy()
+
+    pct_cols = [
+        "mean_pred_pct", "mean_real_pct",
+        "mean_signed_error_pct", "std_signed_error_pct",
+        "mae_pct", "rmse_pct"
+    ]
+    cash_cols = [
+        "mean_pred_abs", "mean_real_abs",
+        "mean_signed_error_abs", "std_signed_error_abs",
+        "mae_abs", "rmse_abs"
+    ]
+    ratio_cols = ["mean_ratio", "std_ratio"]
+
+    for c in pct_cols:
+        if c in df_show.columns:
+            df_show[c] = df_show[c].apply(lambda x: None if pd.isna(x) else f"{x:.2%}")
+
+    for c in cash_cols:
+        if c in df_show.columns:
+            df_show[c] = df_show[c].apply(lambda x: None if pd.isna(x) else f"${x:,.4f}")
+
+    for c in ratio_cols:
+        if c in df_show.columns:
+            df_show[c] = df_show[c].apply(lambda x: None if pd.isna(x) else f"{x:.4f}")
+
+    print("\n=== Backtest Summary by Horizon ===\n")
+    print(tabulate(df_show, headers="keys", tablefmt="github", showindex=False))
+
+
+# ====================== Optional main() integration helper ==================== #
+
+def run_backtest_interactive() -> None:
+    """
+    Optional interactive entry point.
+    Call this from main() if you want backtesting in the same script.
+    """
+    print("\nHistorical Backtest Engine")
+    print("--------------------------")
+    ticker = input("Enter ticker for backtest (e.g., AAPL): ").strip().upper()
+    if not ticker:
+        print("No ticker provided.")
+        return
+
+    years_in = input("Lookback years [default 5]: ").strip()
+    step_in = input("Step size in days [default 3]: ").strip()
+    method_in = input("Prediction method [default hv_proxy]: ").strip() or "hv_proxy"
+
+    years = int(years_in) if years_in else 5
+    step_days = int(step_in) if step_in else 3
+
+    df_all, df_summary, chart_paths = run_full_backtest(
+        ticker=ticker,
+        years=years,
+        step_days=step_days,
+        method=method_in,
+        horizons=TARGET_HORIZONS_DAYS,
+        make_charts=True,
+    )
+
+    if df_all.empty:
+        print("Backtest produced no valid rows.")
+        return
+
+    print_backtest_summary(df_summary)
+
+    print("\nSaved files:")
+    print(f"  - {os.path.join(BACKTEST_OUTPUT_DIR, f'{ticker}_{method_in}_all_backtests.csv')}")
+    print(f"  - {os.path.join(BACKTEST_OUTPUT_DIR, f'{ticker}_{method_in}_summary.csv')}")
+    for p in chart_paths:
+        print(f"  - {p}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
+        sys.exit(130)
+    run_bt = input("\nRun historical backtest as well? [y/N]: ").strip().lower()
+    if run_bt == "y":
+        run_backtest_interactive()
